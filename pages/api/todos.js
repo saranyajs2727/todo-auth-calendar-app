@@ -5,7 +5,9 @@ import { parse } from 'cookie';
 
 export default async function handler(req, res) {
   const cookies = parse(req.headers.cookie || '');
-  if (!cookies.token) return res.status(401).json({ error: 'Unauthorized' });
+  if (!cookies.token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
 
   let user;
   try {
@@ -14,63 +16,144 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 
-  const { method, body } = req;
+  const { method, body, query } = req;
 
   try {
-    // 1. GET / READ
     if (method === 'GET') {
-      const query = gql`
+      const getQuery = gql`
         query GetUserTodos($userId: ID!) {
-          todos(where: { user: { id: $userId } }) {
-            id title date status
+          todos(
+            where: { appUsers_some: { id: $userId } }
+            orderBy: date_ASC
+          ) {
+            id
+            title
+            date
           }
         }
       `;
-      const data = await hygraph.request(query, { userId: user.id });
-      return res.status(200).json(data.todos);
-    }
 
-    // 2. POST / CREATE
+      const data = await hygraph.request(getQuery, {
+        userId: user.id,
+      });
+
+      return res.status(200).json(data?.todos ?? []);
+    }
     if (method === 'POST') {
-      const mutation = gql`
+      if (!body.title || !body.date) {
+        return res.status(400).json({
+          error: 'Title and date are required',
+        });
+      }
+
+      const createMutation = gql`
         mutation CreateTodo($title: String!, $date: Date!, $userId: ID!) {
-          createTodo(data: { title: $title, date: $date, status: "PENDING", user: { connect: { id: $userId } } }) {
-            id title date status
+          createTodo(
+            data: {
+              title: $title
+              date: $date
+              appUsers: { connect: [{ id: $userId }] }
+            }
+          ) {
+            id
+            title
+            date
           }
         }
       `;
-      const data = await hygraph.request(mutation, { title: body.title, date: body.date, userId: user.id });
-      
-      // Auto-publish to bypass Hygraph draft stage limits
-      await hygraph.request(gql`mutation { publishTodo(where: { id: "${data.createTodo.id}" }, to: PUBLISHED) { id } }`);
+
+      const data = await hygraph.request(createMutation, {
+        title: body.title,
+        date: body.date,
+        userId: user.id,
+      });
+
+      if (!data?.createTodo) {
+        return res.status(500).json({
+          error: 'Failed to create todo',
+        });
+      }
+
       return res.status(201).json(data.createTodo);
     }
-
-    // 3. PUT / UPDATE
     if (method === 'PUT') {
-      const mutation = gql`
-        mutation UpdateTodo($id: ID!, $title: String!, $date: Date!, $status: String!) {
-          updateTodo(where: { id: $id }, data: { title: $title, date: $date, status: $status }) {
-            id title date status
+      if (!body.id || !body.title || !body.date) {
+        return res.status(400).json({
+          error: 'ID, title, and date are required',
+        });
+      }
+
+      const updateMutation = gql`
+        mutation UpdateTodo($id: ID!, $title: String!, $date: Date!) {
+          updateTodo(
+            where: { id: $id }
+            data: {
+              title: $title
+              date: $date
+            }
+          ) {
+            id
+            title
+            date
           }
-          publishTodo(where: { id: $id }, to: PUBLISHED) { id }
         }
       `;
-      const data = await hygraph.request(mutation, { id: body.id, title: body.title, date: body.date, status: body.status });
+
+      const data = await hygraph.request(updateMutation, {
+        id: body.id,
+        title: body.title,
+        date: body.date,
+      });
+
+      if (!data?.updateTodo) {
+        return res.status(500).json({
+          error: 'Failed to update todo',
+        });
+      }
+
       return res.status(200).json(data.updateTodo);
     }
-
-    // 4. DELETE
     if (method === 'DELETE') {
-      const mutation = gql`
+      if (!query.id) {
+        return res.status(400).json({
+          error: 'Todo ID is required',
+        });
+      }
+
+      const deleteMutation = gql`
         mutation DeleteTodo($id: ID!) {
-          deleteTodo(where: { id: $id }) { id }
+          deleteTodo(where: { id: $id }) {
+            id
+          }
         }
       `;
-      await hygraph.request(mutation, { id: req.query.id });
-      return res.status(200).json({ success: true });
+
+      const data = await hygraph.request(deleteMutation, {
+        id: query.id,
+      });
+
+      if (!data?.deleteTodo) {
+        return res.status(500).json({
+          error: 'Failed to delete todo',
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        id: query.id,
+      });
     }
+
+    return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    console.error('Todo API error:', error);
+
+    return res.status(500).json({
+      error: error.message || 'Server error',
+      details:
+        process.env.NODE_ENV === 'development'
+          ? error.message
+          : undefined,
+    });
   }
 }
